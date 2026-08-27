@@ -1,0 +1,26 @@
+# colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# ROS and recordings
+.ros/
+bags/
+data/
+*.mcap
+*.db3
+metadata.yaml
+
+# Local configuration and editor files
+.env
+.vscode/
+.idea/
+*~
+*.swp

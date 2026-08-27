@@ -1,0 +1,735 @@
+diff --git a/src/rebotarm_bringup/launch/bringup.launch.py b/src/rebotarm_bringup/launch/bringup.launch.py
+index f5032cc..c00c77c 100644
+--- a/src/rebotarm_bringup/launch/bringup.launch.py
++++ b/src/rebotarm_bringup/launch/bringup.launch.py
+@@ -47,6 +47,13 @@ def generate_launch_description():
+     frame_id = LaunchConfiguration("frame_id")
+     ee_frame_id = LaunchConfiguration("ee_frame_id")
+     disable_after_safe_home = LaunchConfiguration("disable_after_safe_home")
++    teleop_action_topic = LaunchConfiguration("teleop_action_topic")
++    teleop_watchdog_s = LaunchConfiguration("teleop_watchdog_s")
++    teleop_max_command_age_s = LaunchConfiguration("teleop_max_command_age_s")
++    teleop_resume_max_delta_rad = LaunchConfiguration("teleop_resume_max_delta_rad")
++    teleop_gripper_resume_max_delta_rad = LaunchConfiguration(
++        "teleop_gripper_resume_max_delta_rad"
++    )
+     effective_model = LaunchConfiguration("effective_model")
+
+     urdf_file = PathJoinSubstitution(
+@@ -83,6 +90,13 @@ def generate_launch_description():
+             DeclareLaunchArgument("frame_id", default_value="base_link"),
+             DeclareLaunchArgument("ee_frame_id", default_value="end_link"),
+             DeclareLaunchArgument("disable_after_safe_home", default_value="true"),
++            DeclareLaunchArgument("teleop_action_topic", default_value=""),
++            DeclareLaunchArgument("teleop_watchdog_s", default_value="0.1"),
++            DeclareLaunchArgument("teleop_max_command_age_s", default_value="0.1"),
++            DeclareLaunchArgument("teleop_resume_max_delta_rad", default_value="0.35"),
++            DeclareLaunchArgument(
++                "teleop_gripper_resume_max_delta_rad", default_value="1.0"
++            ),
+             OpaqueFunction(function=_resolve_effective_model),
+             Node(
+                 package="rebotarmcontroller",
+@@ -104,6 +118,13 @@ def generate_launch_description():
+                             disable_after_safe_home,
+                             value_type=bool,
+                         ),
++                        "teleop_action_topic": teleop_action_topic,
++                        "teleop_watchdog_s": teleop_watchdog_s,
++                        "teleop_max_command_age_s": teleop_max_command_age_s,
++                        "teleop_resume_max_delta_rad": teleop_resume_max_delta_rad,
++                        "teleop_gripper_resume_max_delta_rad": (
++                            teleop_gripper_resume_max_delta_rad
++                        ),
+                     }
+                 ],
+             ),
+diff --git a/src/rebotarmcontroller/package.xml b/src/rebotarmcontroller/package.xml
+index 786f2c1..ebc14b2 100644
+--- a/src/rebotarmcontroller/package.xml
++++ b/src/rebotarmcontroller/package.xml
+@@ -11,6 +11,7 @@
+
+   <exec_depend>ament_index_python</exec_depend>
+   <exec_depend>control_msgs</exec_depend>
++  <exec_depend>diagnostic_msgs</exec_depend>
+   <exec_depend>geometry_msgs</exec_depend>
+   <exec_depend>rclpy</exec_depend>
+   <exec_depend>rebotarm_msgs</exec_depend>
+diff --git a/src/rebotarmcontroller/rebotarmcontroller/hardware_manager.py b/src/rebotarmcontroller/rebotarmcontroller/hardware_manager.py
+index 12654b1..6dba148 100644
+--- a/src/rebotarmcontroller/rebotarmcontroller/hardware_manager.py
++++ b/src/rebotarmcontroller/rebotarmcontroller/hardware_manager.py
+@@ -77,6 +77,10 @@ class HardwareManager:
+         self.gripper_open_position = float(gripper_limits.get("open", 0.0))
+         self.gripper_close_position = float(gripper_limits.get("close", 0.0))
+         self._gripper_target_position: float | None = None
++        self._teleop_gripper_prev_target: float | None = None
++        self._teleop_gripper_prev_filtered_velocity: float | None = None
++        self._teleop_gripper_prev_state_position: float | None = None
++        self._teleop_gripper_prev_time: float | None = None
+
+         self._gc_model = load_robot_model()
+         self._gc_data = self._gc_model.createData()
+@@ -175,24 +179,52 @@ class HardwareManager:
+     def shutdown(self, disable_after_safe_home: bool = True) -> None:
+         if not self._connected:
+             return
++        shutdown_error: BaseException | None = None
+         try:
+             self.safe_home()
+-            with self._cmd_lock:
+-                self._robot.stop_control_loop()
+-
+-            if disable_after_safe_home:
+-                self.disable()
+-
+-            with self._cmd_lock:
+-                self._robot.disconnect()
++        except BaseException as exc:
++            shutdown_error = exc
+         finally:
+-            self._connected = False
+-            self._enabled = False
++            # The underlying disconnect also disables motors. Keep the explicit
++            # emergency path for the normal collection setting and, critically,
++            # for any exception raised while returning home.
++            if disable_after_safe_home or shutdown_error is not None:
++                self.emergency_shutdown()
++            else:
++                with self._cmd_lock:
++                    self._robot.stop_control_loop()
++                    self._robot.disconnect()
++                    self._connected = False
++                    self._enabled = False
++                    self._control_output_enabled = False
++                    self._state_machine = "IDLE"
++        if shutdown_error is not None:
++            raise shutdown_error
++
++    def emergency_shutdown(self) -> None:
++        """Stop output and disable immediately, without commanding a home move."""
++        with self._cmd_lock:
+             self._control_output_enabled = False
+-            self.set_state_machine("IDLE")
+-
+-    def get_joint_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+-        return self._get_arm_state()
++            self._endpos_ctrl._running = False
++            try:
++                self._robot.stop_control_loop()
++            finally:
++                try:
++                    self._robot.disable_all()
++                finally:
++                    try:
++                        self._robot.disconnect()
++                    finally:
++                        self._connected = False
++                        self._enabled = False
++                        self._gravity_comp_active = False
++                        self._state_machine = "IDLE"
++
++    def get_joint_state(
++        self,
++        request_feedback: bool = True,
++    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++        return self._get_arm_state(request_feedback=request_feedback)
+
+     def _get_arm_state(
+         self,
+@@ -218,8 +250,10 @@ class HardwareManager:
+
+     @_locked
+     def set_joint_position_target(self, positions) -> None:
+-        if self._state_machine == "SAFE_HOMING":
+-            raise RuntimeError("rejecting joint target during safe home")
++        if self._state_machine in ("SAFE_HOMING", "LOWLEVEL_STREAMING"):
++            raise RuntimeError(
++                f"rejecting joint target in state {self._state_machine}"
++            )
+         target = np.asarray(positions, dtype=np.float64).reshape(-1)
+         if len(target) != len(self.joint_names):
+             raise ValueError(
+@@ -369,7 +403,12 @@ class HardwareManager:
+
+     def _require_idle(self, what: str) -> None:
+         state = self._state_machine
+-        if state in ("TRAJ_RUNNING", "GRAVITY_COMP", "SAFE_HOMING"):
++        if state in (
++            "TRAJ_RUNNING",
++            "LOWLEVEL_STREAMING",
++            "GRAVITY_COMP",
++            "SAFE_HOMING",
++        ):
+             raise RuntimeError(f"rejecting {what} in state {state}")
+
+     @_locked
+@@ -415,7 +454,11 @@ class HardwareManager:
+
+     @_locked
+     def start_gravity_compensation(self) -> None:
+-        if self._state_machine in ("TRAJ_RUNNING", "SAFE_HOMING"):
++        if self._state_machine in (
++            "TRAJ_RUNNING",
++            "LOWLEVEL_STREAMING",
++            "SAFE_HOMING",
++        ):
+             raise RuntimeError(
+                 f"rejecting gravity compensation in state {self._state_machine}"
+             )
+@@ -551,10 +594,17 @@ class HardwareManager:
+         reached = self.wait_gripper_target(timeout)
+         return reached, self.get_gripper_state()[0]
+
+-    def get_gripper_state(self) -> tuple[float, float, float, int]:
++    def get_gripper_state(
++        self,
++        request_feedback: bool = True,
++    ) -> tuple[float, float, float, int]:
+         if not self.has_gripper or not self._gripper_name:
+             return 0.0, 0.0, 0.0, 0
+-        pos = float(self._gripper_group.get_positions()[0])
++        pos = float(
++            self._gripper_group.get_positions(
++                request_feedback=request_feedback,
++            )[0]
++        )
+         vel = float(self._gripper_group.get_velocities(request_feedback=False)[0])
+         status = 0
+         torque = 0.0
+@@ -615,6 +665,8 @@ class HardwareManager:
+             raise RuntimeError("rejecting gripper command during safe home")
+         if self.state_machine == "TRAJ_RUNNING":
+             raise RuntimeError("rejecting gripper command while trajectory is running")
++        if allow_endpos and self.state_machine == "LOWLEVEL_STREAMING":
++            raise RuntimeError("rejecting gripper service during teleoperation stream")
+         if not self.has_gripper or not self._gripper_name:
+             raise RuntimeError("gripper is not initialized")
+         if not allow_endpos and self.control_loop_active:
+@@ -626,6 +678,151 @@ class HardwareManager:
+     # helpers
+     # ------------------------------------------------------------------
+
++    @_locked
++    def send_teleop_targets(
++        self,
++        arm_positions,
++        gripper_position: float | None,
++        *,
++        gripper_kp: float = 12.0,
++        gripper_kd: float = 0.05,
++        gripper_motor_kd: float = 0.5,
++        gripper_moving_torque_limit: float = 3.5,
++        gripper_hold_torque_limit: float = 1.0,
++    ) -> None:
++        """Send one coherent whole-arm teleoperation sample.
++
++        The arm group is placed in low-level MIT mode once at stream start.  A
++        sample then produces one grouped arm command and one gripper command,
++        avoiding the read/modify/write cycle used by the per-joint passthrough.
++        """
++        target = np.asarray(arm_positions, dtype=np.float64).reshape(-1)
++        if len(target) != len(self.joint_names):
++            raise ValueError(
++                f"expected {len(self.joint_names)} teleop targets, got {len(target)}"
++            )
++        if not np.all(np.isfinite(target)):
++            raise ValueError("teleop arm target contains non-finite values")
++
++        if self._state_machine != "LOWLEVEL_STREAMING":
++            self._begin_lowlevel_streaming("mit")
++        elif self.mode != "mit":
++            self._enter_mode(
++                self._arm_group,
++                "mit",
++                "arm",
++                kp=self._arm_mit_kp,
++                kd=self._arm_mit_kd,
++            )
++
++        self._arm_group.send_mit(
++            target,
++            vel=np.zeros(len(self.joint_names), dtype=np.float64),
++            kp=self._arm_mit_kp,
++            kd=self._arm_mit_kd,
++            tau=np.zeros(len(self.joint_names), dtype=np.float64),
++        )
++
++        if gripper_position is not None and self.has_gripper:
++            if not np.isfinite(float(gripper_position)):
++                raise ValueError("teleop gripper target is not finite")
++            if self._gripper_group.mode != "mit":
++                self._enter_mode(self._gripper_group, "mit", "gripper")
++            tau = self._teleop_gripper_torque(
++                float(gripper_position),
++                kp=float(gripper_kp),
++                kd=float(gripper_kd),
++                moving_limit=float(gripper_moving_torque_limit),
++                hold_limit=float(gripper_hold_torque_limit),
++            )
++            self._gripper_group.send_mit(
++                np.zeros(1, dtype=np.float64),
++                vel=np.zeros(1, dtype=np.float64),
++                kp=np.zeros(1, dtype=np.float64),
++                kd=np.array([float(gripper_motor_kd)], dtype=np.float64),
++                tau=np.array([tau], dtype=np.float64),
++            )
++            self._gripper_target_position = None
++
++        self.set_state_machine("LOWLEVEL_STREAMING")
++
++    def _teleop_gripper_torque(
++        self,
++        target: float,
++        *,
++        kp: float,
++        kd: float,
++        moving_limit: float,
++        hold_limit: float,
++    ) -> float:
++        now = time.perf_counter()
++        if self._teleop_gripper_prev_time is None:
++            dt = 0.02
++        else:
++            dt = max(0.001, min(0.1, now - self._teleop_gripper_prev_time))
++        self._teleop_gripper_prev_time = now
++
++        previous_target = self._teleop_gripper_prev_target
++        raw_target_velocity = (
++            0.0 if previous_target is None else (target - previous_target) / dt
++        )
++        self._teleop_gripper_prev_target = target
++        alpha = dt / (0.05 + dt)
++        previous_filtered = self._teleop_gripper_prev_filtered_velocity
++        filtered_velocity = (
++            raw_target_velocity
++            if previous_filtered is None
++            else alpha * raw_target_velocity + (1.0 - alpha) * previous_filtered
++        )
++        target_velocity = max(-3.0, min(3.0, filtered_velocity))
++        self._teleop_gripper_prev_filtered_velocity = target_velocity
++
++        # During teleoperation, synchronous feedback requests can block the
++        # 120 Hz command callback for tens of milliseconds. motorbridge's CAN
++        # polling worker updates this cache from command response frames.
++        position, velocity, _, _ = self.get_gripper_state(
++            request_feedback=False,
++        )
++        previous_position = self._teleop_gripper_prev_state_position
++        estimated_velocity = (
++            0.0 if previous_position is None else (position - previous_position) / dt
++        )
++        self._teleop_gripper_prev_state_position = position
++        torque = kp * (target - position) + kd * (target_velocity - velocity)
++        moving = (
++            abs(target_velocity) > 0.05
++            or abs(estimated_velocity) > 0.25
++            or abs(velocity) > 0.25
++        )
++        limit = moving_limit if moving else hold_limit
++        return max(-limit, min(limit, torque))
++
++    @_locked
++    def hold_teleop_position(self, *, gripper_motor_kd: float = 0.5) -> None:
++        """Freeze the current pose after the teleop input watchdog expires."""
++        if not self._enabled or self._state_machine != "LOWLEVEL_STREAMING":
++            return
++        current = self.get_joint_positions(request=True).copy()
++        self._arm_group.send_mit(
++            current,
++            vel=np.zeros(len(self.joint_names), dtype=np.float64),
++            kp=self._arm_mit_kp,
++            kd=self._arm_mit_kd,
++            tau=np.zeros(len(self.joint_names), dtype=np.float64),
++        )
++        if self.has_gripper:
++            self._gripper_group.send_mit(
++                np.zeros(1, dtype=np.float64),
++                vel=np.zeros(1, dtype=np.float64),
++                kp=np.zeros(1, dtype=np.float64),
++                kd=np.array([float(gripper_motor_kd)], dtype=np.float64),
++                tau=np.zeros(1, dtype=np.float64),
++            )
++        self._teleop_gripper_prev_target = None
++        self._teleop_gripper_prev_filtered_velocity = None
++        self._teleop_gripper_prev_state_position = None
++        self._teleop_gripper_prev_time = None
++
+     def _begin_lowlevel_streaming(self, required_mode: str) -> None:
+         if not self._enabled:
+             raise RuntimeError("rejecting low-level command while arm is disabled")
+diff --git a/src/rebotarmcontroller/rebotarmcontroller/rebotarm_controller.py b/src/rebotarmcontroller/rebotarmcontroller/rebotarm_controller.py
+index 3522885..7894355 100644
+--- a/src/rebotarmcontroller/rebotarmcontroller/rebotarm_controller.py
++++ b/src/rebotarmcontroller/rebotarmcontroller/rebotarm_controller.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+
+ import rclpy
+ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+-from rclpy.executors import MultiThreadedExecutor
++from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+ from rclpy.node import Node
+ from rclpy.qos import qos_profile_sensor_data
+
+@@ -11,6 +11,7 @@ from .motor_passthrough import MotorPassthrough
+ from .ros_actions import ArmActions
+ from .ros_publishers import JointStatePublisher
+ from .ros_services import ArmServices
++from .teleop_stream import WholeArmTeleopStream
+
+
+ class reBotArmController(Node):
+@@ -30,6 +31,11 @@ class reBotArmController(Node):
+         self.declare_parameter("frame_id", "base_link")
+         self.declare_parameter("ee_frame_id", "end_link")
+         self.declare_parameter("disable_after_safe_home", True)
++        self.declare_parameter("teleop_action_topic", "")
++        self.declare_parameter("teleop_watchdog_s", 0.1)
++        self.declare_parameter("teleop_max_command_age_s", 0.1)
++        self.declare_parameter("teleop_resume_max_delta_rad", 0.35)
++        self.declare_parameter("teleop_gripper_resume_max_delta_rad", 1.0)
+
+         hardware_config = self.get_parameter("hardware_config").value or None
+         model = str(self.get_parameter("model").value or "")
+@@ -51,22 +57,54 @@ class reBotArmController(Node):
+             model=model,
+             channel=channel,
+         )
+-        self.hardware.connect()
+-
+-        self.joint_state_publisher = JointStatePublisher(
+-            self,
+-            self.hardware,
+-            self.arm_namespace,
+-            joint_state_rate,
+-        )
+-        self.arm_services = ArmServices(self, self.hardware, self.arm_namespace)
+-        self.arm_actions = ArmActions(self, self.hardware, self.arm_namespace)
+-        self.motor_passthrough = MotorPassthrough(
+-            self,
+-            self.hardware,
+-            self.arm_namespace,
+-            cmd_arbitration,
+-        )
++        try:
++            self.hardware.connect()
++
++            self.joint_state_publisher = JointStatePublisher(
++                self,
++                self.hardware,
++                self.arm_namespace,
++                joint_state_rate,
++            )
++            self.arm_services = ArmServices(self, self.hardware, self.arm_namespace)
++            self.arm_actions = ArmActions(self, self.hardware, self.arm_namespace)
++            self.motor_passthrough = MotorPassthrough(
++                self,
++                self.hardware,
++                self.arm_namespace,
++                cmd_arbitration,
++            )
++            teleop_action_topic = str(
++                self.get_parameter("teleop_action_topic").value or ""
++            ).strip()
++            self.teleop_stream = None
++            if teleop_action_topic:
++                self.teleop_stream = WholeArmTeleopStream(
++                    self,
++                    self.hardware,
++                    teleop_action_topic,
++                    watchdog_s=float(self.get_parameter("teleop_watchdog_s").value),
++                    max_command_age_s=float(
++                        self.get_parameter("teleop_max_command_age_s").value
++                    ),
++                    resume_max_delta_rad=float(
++                        self.get_parameter("teleop_resume_max_delta_rad").value
++                    ),
++                    gripper_resume_max_delta_rad=float(
++                        self.get_parameter("teleop_gripper_resume_max_delta_rad").value
++                    ),
++                )
++        except BaseException:
++            self.get_logger().error(
++                "controller startup failed; immediately disabling all motors"
++            )
++            try:
++                self.hardware.emergency_shutdown()
++            except Exception as shutdown_error:
++                self.get_logger().error(
++                    f"emergency motor disable also failed: {shutdown_error}"
++                )
++            raise
+
+         self.get_logger().info(
+             f"reBotArmController started: namespace=/{self.arm_namespace}, "
+@@ -89,11 +127,16 @@ def main(args=None) -> None:
+     executor.add_node(node)
+     try:
+         executor.spin()
++    except (KeyboardInterrupt, ExternalShutdownException):
++        pass
+     finally:
+         node.shutdown()
+         executor.shutdown()
+         node.destroy_node()
+-        rclpy.shutdown()
++        # ROS launch may already have shut the context down. This guard only
++        # fixes process teardown; it does not change the legacy control path.
++        if rclpy.ok():
++            rclpy.shutdown()
+
+
+ if __name__ == "__main__":
+diff --git a/src/rebotarmcontroller/rebotarmcontroller/ros_publishers.py b/src/rebotarmcontroller/rebotarmcontroller/ros_publishers.py
+index 32dbf06..b603eaf 100644
+--- a/src/rebotarmcontroller/rebotarmcontroller/ros_publishers.py
++++ b/src/rebotarmcontroller/rebotarmcontroller/ros_publishers.py
+@@ -65,7 +65,14 @@ class JointStatePublisher:
+
+     def publish(self) -> None:
+         try:
+-            pos, vel, effort = self._hardware.get_joint_state()
++            # LOWLEVEL_STREAMING sends command frames at 120 Hz. RobStride
++            # replies are consumed by motorbridge's background polling worker,
++            # so publish its latest cache instead of injecting a blocking
++            # seven-motor feedback transaction into the control path.
++            request_feedback = self._hardware.state_machine != "LOWLEVEL_STREAMING"
++            pos, vel, effort = self._hardware.get_joint_state(
++                request_feedback=request_feedback,
++            )
+         except Exception as exc:
+             self._node.get_logger().warn(f"joint state read failed: {exc}")
+             return
+@@ -89,7 +96,11 @@ class JointStatePublisher:
+         msg.effort = [float(v) for v in effort]
+
+         if self._gripper_state_publisher is not None:
+-            g_pos, g_vel, g_torque, g_status = self._hardware.get_gripper_state()
++            # The arm read above already refreshed every motor when an explicit
++            # refresh was needed. Never perform a second gripper transaction.
++            g_pos, g_vel, g_torque, g_status = self._hardware.get_gripper_state(
++                request_feedback=False,
++            )
+             joint_pos = _gripper_motor_to_joint_position(
+                 float(g_pos),
+                 self._hardware.gripper_open_position,
+diff --git a/src/rebotarmcontroller/rebotarmcontroller/teleop_stream.py b/src/rebotarmcontroller/rebotarmcontroller/teleop_stream.py
+new file mode 100644
+index 0000000..567e9ad
+--- /dev/null
++++ b/src/rebotarmcontroller/rebotarmcontroller/teleop_stream.py
+@@ -0,0 +1,213 @@
++from __future__ import annotations
++
++import math
++import time
++
++import numpy as np
++from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
++from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
++from sensor_msgs.msg import JointState
++
++
++_EXPECTED_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"]
++_LIMITS_DEG = [
++    (-145.0, 145.0),
++    (0.0, 170.0),
++    (0.0, 200.0),
++    (-80.0, 90.0),
++    (-90.0, 90.0),
++    (-130.0, 130.0),
++    (0.0, 270.0),
++]
++_LIMITS_RAD = [(math.radians(lo), math.radians(hi)) for lo, hi in _LIMITS_DEG]
++
++
++def _diagnostic_level_as_byte(level: int | bytes | bytearray) -> bytes:
++    """Normalize diagnostic_msgs/DiagnosticStatus.level to ROS `byte`."""
++    if isinstance(level, (bytes, bytearray)):
++        if len(level) != 1:
++            raise ValueError(f"diagnostic level must contain one byte, got {level!r}")
++        return bytes(level)
++    value = int(level)
++    if not 0 <= value <= 255:
++        raise ValueError(f"diagnostic level must be in [0, 255], got {value}")
++    return bytes([value])
++
++
++class WholeArmTeleopStream:
++    """Validated, watchdog-protected whole-arm command subscriber."""
++
++    def __init__(
++        self,
++        node,
++        hardware,
++        topic: str,
++        *,
++        watchdog_s: float,
++        max_command_age_s: float,
++        resume_max_delta_rad: float,
++        gripper_resume_max_delta_rad: float,
++    ) -> None:
++        self._node = node
++        self._hardware = hardware
++        self._watchdog_s = max(0.02, float(watchdog_s))
++        self._max_command_age_s = max(0.02, float(max_command_age_s))
++        self._resume_max_delta = max(0.0, float(resume_max_delta_rad))
++        self._gripper_resume_max_delta = max(
++            0.0, float(gripper_resume_max_delta_rad)
++        )
++        self._last_valid_monotonic: float | None = None
++        self._timed_out = False
++        self._accepted = 0
++        self._rejected = 0
++
++        qos = QoSProfile(
++            history=HistoryPolicy.KEEP_LAST,
++            depth=1,
++            reliability=ReliabilityPolicy.RELIABLE,
++        )
++        self._subscription = node.create_subscription(
++            JointState,
++            topic,
++            self._on_action,
++            qos,
++            callback_group=node.reentrant_group,
++        )
++        self._applied_publisher = node.create_publisher(
++            JointState,
++            "/teleop/applied",
++            qos,
++            callback_group=node.reentrant_group,
++        )
++        self._diagnostics = node.create_publisher(
++            DiagnosticArray,
++            "/diagnostics",
++            QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE),
++            callback_group=node.reentrant_group,
++        )
++        self._timer = node.create_timer(
++            min(0.02, self._watchdog_s / 2.0),
++            self._check_watchdog,
++            callback_group=node.reentrant_group,
++        )
++        self._publish_diagnostic(
++            DiagnosticStatus.WARN,
++            "waiting for the first /teleop/action sample",
++        )
++        node.get_logger().info(
++            f"whole-arm teleop stream enabled on {topic}; watchdog={self._watchdog_s:.3f}s"
++        )
++
++    def _on_action(self, msg: JointState) -> None:
++        try:
++            values = self._validate_and_order(msg)
++            if self._timed_out or self._last_valid_monotonic is None:
++                self._validate_resume_delta(values)
++            self._hardware.send_teleop_targets(
++                values[:6],
++                values[6],
++                gripper_kp=12.0,
++                gripper_kd=0.05,
++                gripper_motor_kd=0.5,
++                gripper_moving_torque_limit=3.5,
++                gripper_hold_torque_limit=1.0,
++            )
++            # This is an execution acknowledgement, not merely another copy of
++            # the desired input topic: it is published only after the grouped
++            # arm and gripper writes above return successfully.
++            self._applied_publisher.publish(msg)
++        except Exception as exc:
++            self._rejected += 1
++            self._node.get_logger().warn(f"rejected teleop action: {exc}")
++            self._publish_diagnostic(DiagnosticStatus.ERROR, str(exc))
++            return
++
++        resumed = self._timed_out
++        self._last_valid_monotonic = time.monotonic()
++        self._timed_out = False
++        self._accepted += 1
++        if resumed or self._accepted == 1:
++            self._publish_diagnostic(DiagnosticStatus.OK, "teleop action stream active")
++            self._node.publish_arm_status(read_hardware=False)
++
++    def _validate_and_order(self, msg: JointState) -> np.ndarray:
++        if len(msg.name) != len(_EXPECTED_NAMES) or len(msg.position) != len(_EXPECTED_NAMES):
++            raise ValueError("action must contain exactly joint1..joint6 and gripper")
++        if len(set(msg.name)) != len(msg.name) or set(msg.name) != set(_EXPECTED_NAMES):
++            raise ValueError("action joint names are missing, duplicated, or unknown")
++        stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
++        if stamp_ns <= 0:
++            raise ValueError("action header stamp is zero")
++        now_ns = int(self._node.get_clock().now().nanoseconds)
++        age_s = (now_ns - stamp_ns) / 1_000_000_000.0
++        if age_s > self._max_command_age_s or age_s < -0.05:
++            raise ValueError(f"action timestamp age {age_s:.3f}s is outside the safety window")
++
++        by_name = dict(zip(msg.name, msg.position, strict=True))
++        values = np.asarray([by_name[name] for name in _EXPECTED_NAMES], dtype=np.float64)
++        if not np.all(np.isfinite(values)):
++            raise ValueError("action contains NaN or infinity")
++        for name, value, (lower, upper) in zip(
++            _EXPECTED_NAMES, values, _LIMITS_RAD, strict=True
++        ):
++            if value < lower - 1e-6 or value > upper + 1e-6:
++                raise ValueError(
++                    f"{name}={value:.4f}rad exceeds [{lower:.4f}, {upper:.4f}]"
++                )
++        return values
++
++    def _validate_resume_delta(self, values: np.ndarray) -> None:
++        if self._resume_max_delta <= 0.0:
++            return
++        current = np.asarray(
++            self._hardware.get_joint_positions(request=True), dtype=np.float64
++        )
++        max_delta = float(np.max(np.abs(values[:6] - current)))
++        if max_delta > self._resume_max_delta:
++            raise ValueError(
++                f"resume alignment required: arm delta {max_delta:.3f}rad exceeds "
++                f"{self._resume_max_delta:.3f}rad"
++            )
++        if self._hardware.has_gripper and self._gripper_resume_max_delta > 0.0:
++            current_gripper = float(self._hardware.get_gripper_state()[0])
++            gripper_delta = abs(float(values[6]) - current_gripper)
++            if gripper_delta > self._gripper_resume_max_delta:
++                raise ValueError(
++                    f"resume alignment required: gripper delta {gripper_delta:.3f}rad exceeds "
++                    f"{self._gripper_resume_max_delta:.3f}rad"
++                )
++
++    def _check_watchdog(self) -> None:
++        if self._last_valid_monotonic is None or self._timed_out:
++            return
++        elapsed = time.monotonic() - self._last_valid_monotonic
++        if elapsed <= self._watchdog_s:
++            return
++        try:
++            self._hardware.hold_teleop_position(gripper_motor_kd=0.5)
++        except Exception as exc:
++            self._node.get_logger().error(f"teleop watchdog hold failed: {exc}")
++            self._publish_diagnostic(DiagnosticStatus.ERROR, f"watchdog hold failed: {exc}")
++        else:
++            self._publish_diagnostic(
++                DiagnosticStatus.WARN,
++                f"teleop input stale for {elapsed:.3f}s; holding current pose",
++            )
++        self._timed_out = True
++        self._node.publish_arm_status(read_hardware=False)
++
++    def _publish_diagnostic(self, level: int | bytes, message: str) -> None:
++        item = DiagnosticStatus()
++        item.level = _diagnostic_level_as_byte(level)
++        item.name = "rebot_collection/teleop_action"
++        item.hardware_id = "reBotArm-B601-RS"
++        item.message = message
++        item.values = [
++            KeyValue(key="accepted_samples", value=str(self._accepted)),
++            KeyValue(key="rejected_samples", value=str(self._rejected)),
++            KeyValue(key="watchdog_seconds", value=f"{self._watchdog_s:.3f}"),
++        ]
++        array = DiagnosticArray()
++        array.header.stamp = self._node.get_clock().now().to_msg()
++        array.status = [item]
++        self._diagnostics.publish(array)

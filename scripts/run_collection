@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+official_ws="${REBOT_OFFICIAL_WS:-$HOME/rebotarm_ros2}"
+collection_ws="${REBOT_COLLECTION_WS:-$HOME/rs_collection/ros2_ws}"
+official_setup="$official_ws/install/setup.bash"
+collection_setup="$collection_ws/install/setup.bash"
+bag_root="${REBOT_BAG_ROOT:-$HOME/sun_ws/data}"
+lerobot_python="${REBOT_LEROBOT_PYTHON:-$HOME/miniforge3/envs/lerobot/bin/python}"
+serial_port="${REBOT_LEADER_PORT:-/dev/ttyUSB0}"
+head_camera_device_link="${REBOT_HEAD_CAMERA_DEVICE:-${REBOT_LEFT_CAMERA_DEVICE:-${REBOT_CAMERA_DEVICE:-/dev/v4l/by-id/usb-icSpring_icspring_camera_20240307110322-video-index0}}}"
+camera_wrist_device_link="${REBOT_CAMERA_WRIST_DEVICE:-${REBOT_WRIST_CAMERA_DEVICE:-/dev/v4l/by-id/usb-RYS_USB_Camera_200901010001-video-index0}}"
+head_camera_device=""
+camera_wrist_device=""
+launch_pid=""
+cleanup_started=0
+ros_environment_loaded=0
+arm_chain_started=0
+
+emergency_disable_follower() {
+  if (( ! ros_environment_loaded || ! arm_chain_started )); then
+    return
+  fi
+  echo "发送最终硬件失能命令……"
+  if python3 -c 'from rebotarmcontroller.hardware_config import resolve_hardware_config; path, _ = resolve_hardware_config(None, "rs", "can0"); from reBotArm_control_py.actuator import RebotArm; arm = RebotArm(hw_yaml=str(path)); arm.connect(); arm.estop(); arm.disconnect()'; then
+    echo "从臂已失能。"
+  else
+    echo "警告：最终硬件失能命令失败，请立即切断从臂电源。" >&2
+  fi
+  arm_chain_started=0
+}
+
+cleanup() {
+  if (( cleanup_started )); then
+    return
+  fi
+  cleanup_started=1
+  if [[ -n "$launch_pid" ]] && kill -0 "$launch_pid" 2>/dev/null; then
+    echo "正在安全停止 ROS 2、从臂和相机画面……"
+    kill -INT -- "-$launch_pid" 2>/dev/null || true
+    for _ in $(seq 1 200); do
+      if ! kill -0 "$launch_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$launch_pid" 2>/dev/null; then
+      kill -TERM -- "-$launch_pid" 2>/dev/null || true
+    fi
+    wait "$launch_pid" 2>/dev/null || true
+  fi
+  emergency_disable_follower
+}
+trap cleanup EXIT TERM
+trap ':' INT
+
+if [[ ! -f /opt/ros/jazzy/setup.bash ]]; then
+  echo "错误：ROS 2 Jazzy 尚未安装。" >&2
+  exit 1
+fi
+if [[ ! -f "$official_setup" || ! -f "$collection_setup" ]]; then
+  echo "错误：ROS 2 工作区尚未构建；缺少 setup.bash。" >&2
+  exit 1
+fi
+if [[ ! -x "$lerobot_python" ]]; then
+  echo "错误：找不到 LeRobot Python：$lerobot_python" >&2
+  exit 1
+fi
+if [[ ! -e "$serial_port" ]]; then
+  echo "错误：找不到主臂串口 $serial_port。" >&2
+  exit 1
+fi
+resolve_camera_device() {
+  local label="$1"
+  local device_link="$2"
+  local resolved_device
+  if [[ ! -e "$device_link" ]]; then
+    echo "错误：找不到 ${label} 相机：$device_link" >&2
+    return 1
+  fi
+  resolved_device="$(readlink -f "$device_link")"
+  if [[ ! "$resolved_device" =~ ^/dev/video[0-9]+$ ]]; then
+    echo "错误：${label} 相机未解析到有效的 /dev/videoN：$resolved_device" >&2
+    return 1
+  fi
+  printf '%s' "$resolved_device"
+}
+
+head_camera_device="$(resolve_camera_device head "$head_camera_device_link")"
+camera_wrist_device="$(resolve_camera_device camera_wrist "$camera_wrist_device_link")"
+if [[ "$head_camera_device" == "$camera_wrist_device" ]]; then
+  echo "错误：head 和 camera_wrist 解析到了同一个设备 $head_camera_device。" >&2
+  exit 1
+fi
+if pgrep -af 'lerobot-teleoperate|lerobot-record|motorbridge-gateway' >/dev/null; then
+  echo "错误：检测到会争用 CAN/串口的旧链路：" >&2
+  pgrep -af 'lerobot-teleoperate|lerobot-record|motorbridge-gateway' >&2 || true
+  echo "请先关闭 run_teleop、lerobot-record 或 motorbridge-gateway。" >&2
+  exit 1
+fi
+
+echo "需要 sudo 配置 PCAN-USB/can0 和主臂串口权限。"
+sudo -v
+sudo modprobe peak_usb
+sudo chmod 666 "$serial_port"
+if ! ip link show can0 >/dev/null 2>&1; then
+  echo "错误：PCAN-USB 未生成 can0。请检查 USB 和 peak_usb 驱动。" >&2
+  exit 1
+fi
+sudo ip link set can0 down 2>/dev/null || true
+sudo ip link set can0 type can bitrate 1000000
+sudo ip link set can0 up
+
+# Auto exposure can silently reduce a UVC camera below 30 FPS. Manual exposure
+# keeps both streams within the 33 ms camera period.
+head_camera_exposure="${REBOT_HEAD_CAMERA_EXPOSURE:-${REBOT_LEFT_CAMERA_EXPOSURE:-${REBOT_CAMERA_EXPOSURE:-200}}}"
+camera_wrist_exposure="${REBOT_WRIST_CAMERA_EXPOSURE:-200}"
+v4l2-ctl -d "$head_camera_device" \
+  --set-ctrl="auto_exposure=1,exposure_time_absolute=${head_camera_exposure},power_line_frequency=0"
+v4l2-ctl -d "$camera_wrist_device" \
+  --set-ctrl="auto_exposure=1,exposure_time_absolute=${camera_wrist_exposure},power_line_frequency=0,exposure_dynamic_framerate=0"
+
+# ROS 2/ament setup files intentionally probe optional, unset variables.
+# Temporarily disable nounset while sourcing them, then restore strict mode.
+set +u
+source /opt/ros/jazzy/setup.bash
+source "$official_setup"
+source "$collection_setup"
+set -u
+ros_environment_loaded=1
+
+echo "启动 ROS 2 B601-RS 遥操采集链路（control/state 120Hz，双相机 30Hz）……"
+arm_chain_started=1
+setsid ros2 launch rebot_collection collection.launch.py \
+  serial_port:="$serial_port" \
+  conda_python:="$lerobot_python" \
+  head_camera_device:="$head_camera_device" \
+  camera_wrist_device:="$camera_wrist_device" &
+launch_pid=$!
+
+required_live_topics=(
+  /teleop/action
+  /rebotarm/joint_states
+  /head/image_raw
+  /camera_wrist/image_raw
+)
+
+required_topics_ready() {
+  local available_topics
+  local topic
+  available_topics="$(ros2 topic list 2>/dev/null)" || return 1
+  for topic in "${required_live_topics[@]}"; do
+    if ! grep -qxF "$topic" <<<"$available_topics"; then
+      return 1
+    fi
+  done
+}
+
+for _ in $(seq 1 60); do
+  if ! kill -0 "$launch_pid" 2>/dev/null; then
+    echo "错误：ROS 2 启动进程提前退出。" >&2
+    wait "$launch_pid" || true
+    exit 1
+  fi
+  if required_topics_ready; then
+    break
+  fi
+  sleep 0.5
+done
+if ! required_topics_ready; then
+  echo "错误：30 秒内未等到 action/state/head/camera_wrist 必需话题。" >&2
+  exit 1
+fi
+
+set +e
+ros2 run rebot_collection keyboard_collection_node --ros-args \
+  -p bag_root:="$bag_root"
+keyboard_status=$?
+set -e
+if (( keyboard_status != 0 && keyboard_status != 130 )); then
+  echo "keyboard_collection_node 退出码：$keyboard_status" >&2
+fi
